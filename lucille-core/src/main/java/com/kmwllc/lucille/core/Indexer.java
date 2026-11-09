@@ -793,6 +793,14 @@ public abstract class Indexer implements Runnable {
   }
 
   /**
+   * The configured indexer.maxRetries, or 0 when retries are disabled. A retried batch is passed to {@link #sendToIndex}
+   * again as the same List instance, on the same thread, up to this many times.
+   */
+  protected final int getMaxRetries() {
+    return maxRetries;
+  }
+
+  /**
    * Returns the id the given document is written under at the destination: its {@link #getDocIdOverride} value when it
    * has one, otherwise its document id.
    */

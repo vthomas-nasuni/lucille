@@ -31,6 +31,7 @@ The block selects the indexer once `lucille-opensearch` is on the classpath.
 | `versionType` | String | No | Versioning type for writes. Takes a client `VersionType` name, case-insensitive, as the constant name (`External`, `ExternalGte`, `Internal`, `Force`) or its JSON spelling (`external`, `external_gte`, `internal`, `force`); any other value fails at startup. Only `External` and `ExternalGte` are sent with writes; `Internal` and `Force` are accepted but no version or version type is sent. |
 | `versionField` | String | No | Document field holding a numeric version. Used when the document has it, else the Kafka offset of a document read from Kafka, else no version. A delete by ID uses only this field, never the Kafka offset. Fails at startup if it is set without `versionType`. |
 | `routingField` | String | No | Document field whose value is sent as the routing key. |
+| `splitOnRequestTooLarge` | Boolean | No | Split a bulk upload that OpenSearch rejects with HTTP 413 in half, and send each half on its own. See [Request Too Large](#request-too-large). Default: `false`. |
 | `connectTimeoutMs` | Long | No | Maximum time to establish a connection, including the TLS handshake, in ms. Must be at least 1. Default: `5000`. |
 | `socketTimeoutMs` | Long | No | Maximum time to wait for data on an open connection, including a response, in ms. Applies to delete-by-query too, so raise it above the slowest expected request, or set `-1` for no limit. Any other value below 1 fails at startup. A timeout is a transport failure (status `-1`), retried when `indexer.maxRetries` is set; OpenSearch may still complete the request. Default: `30000`. |
 | `connectionTimeToLiveMs` | Long | No | Maximum lifetime of a pooled connection, in ms, so long-running clients behind a load balancer or Kubernetes Service reconnect and reach new nodes. Lower it to rebalance faster. Expiry is checked when a connection is next used, so it never interrupts a request. Must be at least 1. Default: `300000` (5 minutes). |
@@ -64,7 +65,7 @@ When `routingField` is set, the value of that field on each document (first valu
 
 ## Version Type
 
-`versionType` is an OpenSearch `VersionType`, as the constant name (`External`, `ExternalGte`, `Internal`, `Force`) or the JSON spelling (`external`, `external_gte`, `internal`, `force`), case-insensitive. Any other value fails at startup. Only `External` and `ExternalGte` send a version with each operation, which enables optimistic concurrency control: OpenSearch rejects a write if the incoming version is not greater than (or, for `ExternalGte`, greater than or equal to) the stored version, and that document fails.
+`versionType` is an OpenSearch `VersionType`, as the constant name (`External`, `ExternalGte`, `Internal`, `Force`) or the JSON spelling (`external`, `external_gte`, `internal`, `force`), case-insensitive. Any other value fails at startup. Only `External` and `ExternalGte` send a version with each operation, which enables optimistic concurrency control: OpenSearch rejects a write with a 409 if the incoming version is not greater than (or, for `ExternalGte`, greater than or equal to) the stored version. That document is reported as succeeded, because the index already holds that version or a newer one: either a newer write superseded it, or a retry of the batch resent an upload that was already applied. A 409 on an upload sent without a version (no `versionType` of `External` or `ExternalGte`, or no version for that document) is a concurrent-modification conflict, and that document fails.
 
 The version for each document is chosen as follows:
 
@@ -121,8 +122,22 @@ Retries follow the generic `indexer.maxRetries` settings (see [Retries]({{< relr
 - A request that fails with an HTTP error carries that status code; a transport failure (connection refused, socket timeout) carries `-1`. The batch is retried if the code is in `indexer.retryableStatusCodes`, and otherwise fails as a whole.
 - A document rejected in the bulk response carries the item's HTTP status code. If any rejected document's status is retryable (for example 429 but not 400), the whole batch is resent; once retries run out, or if none is retryable, only the rejected documents fail.
 - A bulk response error whose ID does not match a document in the batch fails the whole batch and is not retried.
-- With `versionType: External`, a retry resends uploads the destination already accepted, and each is rejected with a 409 because its version is already there. Those documents get FAIL events even though they were indexed. `ExternalGte` accepts an equal version, so it is not affected.
-- An error on any delete-by-ID item, or any failure reported by delete-by-query, fails the whole batch and is not retried. A 409 on a versioned delete is not an error (see [Version Type](#version-type)). Documents uploaded earlier in the same send were already indexed but still get FAIL events.
+- An error on any delete-by-ID item, or any failure reported by delete-by-query, fails the delete request and is not retried. A 409 on a versioned upload or delete is not an error (see [Version Type](#version-type)).
+
+When `indexer.maxRetries` is set, a retry of a batch picks up where the earlier attempts left off:
+
+- An operation OpenSearch already completed (an upload, a delete by ID, or a delete-by-query) is not sent again, and counts as succeeded. Re-sending one is not harmless: with `ExternalGte` an equal version is a real write, which can re-create a document that a newer delete removed once that delete's tombstone has expired (`index.gc_deletes`), and a resent delete can remove documents written after it in the batch.
+- A document that failed with a non-retryable error is not sent again, and its failure is reported again.
+- Once anything in the batch has completed, an exception from a later request (an upload, a delete by ID or a delete-by-query) fails only the documents in that request, not the whole batch. Until then, it fails the whole batch, as without retries.
+- After a part of the batch has a retryable failure, the rest of the batch is not sent on that attempt, so the retry resumes in batch order and a delete-by-query is never sent ahead of an earlier upload that the retry sends again. The final attempt sends everything left, since no retry follows it.
+
+Without `indexer.maxRetries`, every part of the batch is sent once, and an exception fails the whole batch.
+
+### Request Too Large
+
+OpenSearch rejects a request body over `http.max_content_length` (100MB by default) with HTTP 413. `indexer.batchByteSize` keeps bulk requests below a size, but it is an estimate. By default, a 413 fails the whole batch: it arrives without a parseable error body, so it is reported as a transport failure (status `-1`), and is retried when `-1` is in `indexer.retryableStatusCodes`.
+
+With `splitOnRequestTooLarge: true`, a 413 on a bulk upload is recognized from the response, and the upload is split in half and each half sent on its own, recursively, until each part is accepted. A single document that still gets a 413 fails permanently by itself and is not retried. Once an upload is split, each half's failures stay with that half's documents. Deletes are never split.
 
 ---
 
@@ -136,7 +151,7 @@ If a document has children and `childDocumentsField` is not set, the children ar
 
 ## Deletion
 
-Supports delete by ID and delete by query using the generic `deletionMarker` and `deleteByQuery` settings (see [Deletion Mechanics]({{< relref "docs/ingest-design/indexers#deletion-mechanics" >}})). Delete-by-query documents in a batch are combined into one `terms` bool/should query per target index, so a document matching any of them is deleted. The value to match is the first value of the field `deleteByQuery.valueField` names, if it is multi-valued.
+Supports delete by ID and delete by query using the generic `deletionMarker` and `deleteByQuery` settings (see [Deletion Mechanics]({{< relref "docs/ingest-design/indexers#deletion-mechanics" >}})). Delete-by-query documents in a batch are combined into one `terms` bool/should query per target index, so a document matching any of them is deleted. The value to match is the first value of the field `deleteByQuery.valueField` names, if it is multi-valued. A delete-by-query document whose field name or value is null can't be part of a `terms` query, so it fails on its own without failing the rest of its batch.
 
 Delete-by-query documents are sent in batch order: the uploads and deletes by ID before a delete-by-query document are sent before its query, and the ones after it are sent after. Consecutive delete-by-query documents are combined into one delete-by-query per index. Between two delete-by-query documents, only the last document for a given index and ID is acted on: if the same ID appears in both an upload and a delete by ID, the last occurrence wins, and earlier documents with that ID are not sent but are still reported as succeeded. A document marked for delete-by-query also cancels an earlier upload with the same ID since the previous delete-by-query document. Each run of uploads and deletes by ID is sent as one bulk request for uploads and one for deletes by ID. Before each delete-by-query, the indexer refreshes the target index, because delete-by-query only matches refreshed documents. So a delete-by-query deletes matching documents uploaded before it, in the same batch or an earlier one, but not documents after it in the batch, such as new children sent after a delete of their parent's old children. Each delete-by-query adds a refresh and more bulk requests to the send, so frequent delete-by-query documents on a large index are slow.
 

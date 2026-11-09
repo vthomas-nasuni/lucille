@@ -16,11 +16,15 @@ import com.kmwllc.lucille.opensearch.util.OpenSearchUtils;
 import com.typesafe.config.Config;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.stream.Collectors;
 import org.apache.commons.lang3.tuple.Pair;
 import org.opensearch.client.opensearch.OpenSearchClient;
@@ -34,6 +38,7 @@ import org.opensearch.client.opensearch.core.BulkResponse;
 import org.opensearch.client.opensearch.core.DeleteByQueryRequest;
 import org.opensearch.client.opensearch.core.DeleteByQueryResponse;
 import org.opensearch.client.opensearch.core.bulk.BulkResponseItem;
+import org.opensearch.client.transport.httpclient5.ResponseException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -64,7 +69,17 @@ import org.slf4j.LoggerFactory;
  *   <li>versionField (String, Optional) : Document field holding the external version. Requires
  *   versionType. With External or ExternalGte, a delete by id carries this field's value too; a delete without it
  *   is unversioned, and never uses the Kafka offset.</li>
+ *   <li>splitOnRequestTooLarge (Boolean, Optional) : When OpenSearch rejects a bulk upload with HTTP 413 (a body over
+ *   http.max_content_length), split it in half and send each half on its own. A single document that still gets a 413
+ *   fails permanently. Defaults to false.</li>
  * </ul>
+ * <p>
+ * With versionType External or ExternalGte, a 409 on an upload or delete by id sent with a version is a success: the
+ * index already holds that version or a newer one.
+ * <p>
+ * When indexer.maxRetries is set, a retry of a batch doesn't send again the operations OpenSearch completed or the ones
+ * that failed permanently, and resumes in input order. Once part of a batch has completed, an exception from a later
+ * request fails only the documents in that request.
  */
 @AutoService(Indexer.class)
 @IndexerType("OpenSearch")
@@ -73,12 +88,15 @@ public class OpenSearchIndexer extends Indexer {
   public static final Spec SPEC = SpecBuilder.indexer()
       .requiredString("index")
       .requiredStringOrList("url")
-      .optionalBoolean("update", "acceptInvalidCert", "useCompression")
+      .optionalBoolean("update", "acceptInvalidCert", "useCompression", "splitOnRequestTooLarge")
       .optionalNumber("maxConnectionsPerRoute", "maxConnectionsTotal",
           "connectTimeoutMs", "socketTimeoutMs", "connectionTimeToLiveMs")
       .optionalString("childDocumentsField", "routingField", "versionType", "versionField").build();
 
   private static final Logger log = LoggerFactory.getLogger(OpenSearchIndexer.class);
+
+  private static final int HTTP_CONFLICT = 409;
+  private static final int HTTP_REQUEST_TOO_LARGE = 413;
 
   // not final: the standard constructor builds it only after validation, see there
   private OpenSearchClient client;
@@ -94,6 +112,12 @@ public class OpenSearchIndexer extends Indexer {
 
   private final String childDocumentsField;
 
+  // split a bulk upload OpenSearch rejects with HTTP 413 in half, and send each half on its own
+  private final boolean splitOnRequestTooLarge;
+
+  // the attempts at the batch this thread is sending, when indexer.maxRetries is set. See sendAttempt.
+  private final ThreadLocal<BatchAttempt> batchAttempt = new ThreadLocal<>();
+
   public OpenSearchIndexer(Config config, IndexerContext context, OpenSearchClient client) {
     super(config, context);
 
@@ -105,6 +129,7 @@ public class OpenSearchIndexer extends Indexer {
         config.hasPath("opensearch.versionType") ? parseVersionType(config.getString("opensearch.versionType")) : null;
     this.childDocumentsField = ConfigUtils.getStringOrDefault(config, "opensearch.childDocumentsField", null);
     this.versionField = ConfigUtils.getStringOrDefault(config, "opensearch.versionField", null);
+    this.splitOnRequestTooLarge = ConfigUtils.getBooleanOrDefault(config, "opensearch.splitOnRequestTooLarge", false);
 
     // validate config opensearch.versionType that must be set if config opensearch.versionField is set
     if (this.versionField != null && this.versionType == null) {
@@ -166,19 +191,48 @@ public class OpenSearchIndexer extends Indexer {
 
   @Override
   protected List<IndexerFailure> sendToIndex(List<Document> documents) throws IndexerException {
-    Map<Pair<String, String>, Document> documentsToUpload = new LinkedHashMap<>();
-    // the document that marked each (index, id) for deletion, so deleteById can send its version
-    Map<Pair<String, String>, Document> idsToDelete = new LinkedHashMap<>();
-    Map<Pair<String, String>, List<String>> termsToDeleteByQuery = new LinkedHashMap<>();
-    List<IndexerFailure> failedDocs = new ArrayList<>();
+    // documents are reported at most once, in the order they fail
+    Map<Document, Exception> failures = new IdentityHashMap<>();
+    List<Segment> segments = toSegments(documents, failures);
 
-    // populate which collection each document belongs to
-    // upload if document is not marked for deletion
-    // else if document is marked for deletion ONLY, then only add to idsToDelete
-    // else document is marked for deletion AND carries both indexer.deleteByQuery fields, only add to termsToDeleteByQuery
-    // A delete-by-query must not delete documents that come after it in the batch, so the batch is sent in segments, in
-    // input order: pending uploads and deletes by id are sent before a run of delete-by-query documents, and the
-    // queries are sent before the next upload or delete by id.
+    // Without retries every segment is sent, and a thrown exception fails the whole batch, as it always has.
+    BatchAttempt attempt = startAttempt(documents);
+    if (attempt == null) {
+      for (Segment segment : segments) {
+        if (segment instanceof WriteSegment write) {
+          addFailures(failures, uploadDocuments(write.uploads));
+          deleteById(write.deletes);
+        } else {
+          deleteByQuery(deleteByQueryTerms(((QuerySegment) segment).documents()));
+        }
+      }
+      return toFailureList(documents, failures);
+    }
+
+    Throwable thrown = null;
+    try {
+      sendAttempt(attempt, segments, failures);
+      return toFailureList(documents, failures);
+    } catch (Throwable t) {
+      thrown = t;
+      throw t;
+    } finally {
+      finishAttempt(attempt, thrown, failures);
+    }
+  }
+
+  /**
+   * Splits the batch into the requests it is sent as, in input order. A delete-by-query must not delete documents that
+   * come after it in the batch, so pending uploads and deletes by id form a segment that is sent before a run of
+   * delete-by-query documents, and the queries are sent before the next upload or delete by id. Within a write segment
+   * only the last operation on each (index, id) is sent. A delete-by-query document whose field name or value is null
+   * can't be part of a terms query, so it is added to failures instead.
+   */
+  private List<Segment> toSegments(List<Document> documents, Map<Document, Exception> failures) {
+    List<Segment> segments = new ArrayList<>();
+    WriteSegment write = null;
+    List<Document> queryDocs = null;
+
     for (Document doc : documents) {
       // use doc id override if specified, otherwise delete will try to delete wrong id
       String id = getDestinationId(doc);
@@ -188,51 +242,268 @@ public class OpenSearchIndexer extends Indexer {
 
       Pair<String, String> indexAndId = Pair.of(indexToSend, id);
 
-      if (!isMarkedForDeletion(doc)) {
-        // send any buffered delete-by-queries now, so they apply before this write rather than after it
-        sendDeleteByQuerySegment(termsToDeleteByQuery);
-        idsToDelete.remove(indexAndId);
-        documentsToUpload.put(indexAndId, doc);
-      } else {
-        documentsToUpload.remove(indexAndId);
-        if (!isDeleteByQuery(doc)) {
-          // same as above: buffered delete-by-queries go before this delete by id
-          sendDeleteByQuerySegment(termsToDeleteByQuery);
-          idsToDelete.put(indexAndId, doc);
-        } else {
-          // this doc is a delete-by-query, so flush the writes buffered before it first: send the pending uploads and
-          // deletes by id, clear both maps, and collect their per-doc failures
-          failedDocs.addAll(sendWriteSegment(documentsToUpload, idsToDelete));
-          Pair<String, String> indexAndDeleteByField = Pair.of(indexToSend, getDeleteByQueryFieldName(doc));
-          if (!termsToDeleteByQuery.containsKey(indexAndDeleteByField)) {
-            termsToDeleteByQuery.put(indexAndDeleteByField, new ArrayList<>());
-          }
-          termsToDeleteByQuery.get(indexAndDeleteByField).add(getDeleteByQueryValue(doc));
+      if (!isDeleteByQuery(doc)) {
+        // a buffered run of delete-by-queries goes before this write rather than after it
+        if (queryDocs != null) {
+          segments.add(new QuerySegment(queryDocs));
+          queryDocs = null;
         }
+        if (write == null) {
+          write = new WriteSegment();
+        }
+        if (!isMarkedForDeletion(doc)) {
+          write.deletes.remove(indexAndId);
+          write.uploads.put(indexAndId, doc);
+        } else {
+          write.uploads.remove(indexAndId);
+          write.deletes.put(indexAndId, doc);
+        }
+      } else {
+        if (write != null) {
+          write.uploads.remove(indexAndId);
+        }
+        String fieldName = getDeleteByQueryFieldName(doc);
+        String value = getDeleteByQueryValue(doc);
+        if (fieldName == null || value == null) {
+          failures.putIfAbsent(doc, new IndexerException("Document " + doc.getId() + " is marked for delete by query but "
+              + "its " + (fieldName == null ? "field name" : "value") + " is null"));
+          continue;
+        }
+        // the writes buffered before this delete-by-query are sent first
+        if (write != null) {
+          segments.add(write);
+          write = null;
+        }
+        if (queryDocs == null) {
+          queryDocs = new ArrayList<>();
+        }
+        queryDocs.add(doc);
       }
     }
 
-    // at most one of these has anything left to send
-    failedDocs.addAll(sendWriteSegment(documentsToUpload, idsToDelete));
-    sendDeleteByQuerySegment(termsToDeleteByQuery);
-
-    return failedDocs;
+    // at most one of these is non-null
+    if (write != null) {
+      segments.add(write);
+    }
+    if (queryDocs != null) {
+      segments.add(new QuerySegment(queryDocs));
+    }
+    return segments;
   }
 
-  // Sends and clears the pending uploads and deletes by id. They never share an (index, id), so their order between
-  // each other doesn't matter.
-  private List<IndexerFailure> sendWriteSegment(Map<Pair<String, String>, Document> documentsToUpload,
-      Map<Pair<String, String>, Document> idsToDelete) throws IndexerException {
-    List<IndexerFailure> failedDocs = uploadDocuments(documentsToUpload);
-    deleteById(idsToDelete);
-    documentsToUpload.clear();
-    idsToDelete.clear();
-    return failedDocs;
+  /**
+   * One attempt at sending a batch when indexer.maxRetries is set. The base Indexer retries a batch by calling
+   * sendToIndex again with the same List, so this remembers, across the attempts at one batch, which operations
+   * OpenSearch completed and which failed in a way a retry can't fix:
+   * <ul>
+   *   <li>An operation completed on an earlier attempt (an upload, a delete by id or a delete-by-query) is not sent
+   *   again, and counts as succeeded. Re-sending it is not harmless: with ExternalGte an equal version is a real write,
+   *   which can re-create a document that a newer delete removed once that delete's tombstone has expired
+   *   (index.gc_deletes), and a delete-by-query or delete by id sent again can remove documents written after it.</li>
+   *   <li>An operation that failed with a non-retryable error is not sent again, and its failure is reported again.</li>
+   *   <li>Once any operation in the batch has completed, an exception thrown by a request is returned as a failure of
+   *   each document that request was sending, instead of failing the whole batch, completed documents included.</li>
+   *   <li>After a segment with a retryable failure, the rest of the batch is not sent on this attempt, and is reported
+   *   as a retryable failure, so the retry resumes in input order and nothing is sent ahead of a failed operation that
+   *   comes before it. The final attempt sends everything, since no retry follows it.</li>
+   * </ul>
+   */
+  private void sendAttempt(BatchAttempt attempt, List<Segment> segments, Map<Document, Exception> failures)
+      throws IndexerException {
+    boolean finalAttempt = attempt.attempts > getMaxRetries();
+    IndexerRetryableException stoppedBy = null;
+
+    for (Segment segment : segments) {
+      if (stoppedBy != null) {
+        for (Document doc : segment.documents()) {
+          if (!attempt.completed.contains(doc)) {
+            failures.putIfAbsent(doc, attempt.permanentFailures.containsKey(doc)
+                ? attempt.permanentFailures.get(doc)
+                : notSent(stoppedBy));
+          }
+        }
+        continue;
+      }
+
+      Map<Document, Exception> segmentFailures = new IdentityHashMap<>();
+      if (segment instanceof WriteSegment write) {
+        Map<Pair<String, String>, Document> uploads = pending(attempt, write.uploads, segmentFailures);
+        try {
+          addFailures(segmentFailures, uploadDocuments(uploads));
+        } catch (IndexerException e) {
+          failAll(attempt, uploads.values(), e, segmentFailures);
+        }
+        recordOutcome(attempt, uploads.values(), segmentFailures);
+
+        Map<Pair<String, String>, Document> deletes = pending(attempt, write.deletes, segmentFailures);
+        try {
+          deleteById(deletes);
+        } catch (IndexerException e) {
+          failAll(attempt, deletes.values(), e, segmentFailures);
+        }
+        recordOutcome(attempt, deletes.values(), segmentFailures);
+      } else {
+        List<Document> queryDocs = new ArrayList<>();
+        for (Document doc : segment.documents()) {
+          if (attempt.permanentFailures.containsKey(doc)) {
+            segmentFailures.put(doc, attempt.permanentFailures.get(doc));
+          } else if (!attempt.completed.contains(doc)) {
+            queryDocs.add(doc);
+          }
+        }
+        try {
+          deleteByQuery(deleteByQueryTerms(queryDocs));
+        } catch (IndexerException e) {
+          failAll(attempt, queryDocs, e, segmentFailures);
+        }
+        recordOutcome(attempt, queryDocs, segmentFailures);
+      }
+
+      for (Map.Entry<Document, Exception> failure : segmentFailures.entrySet()) {
+        failures.putIfAbsent(failure.getKey(), failure.getValue());
+        if (stoppedBy == null && !finalAttempt && isRetryable(failure.getValue())) {
+          stoppedBy = (IndexerRetryableException) failure.getValue();
+        }
+      }
+    }
   }
 
-  private void sendDeleteByQuerySegment(Map<Pair<String, String>, List<String>> termsToDeleteByQuery) throws IndexerException {
-    deleteByQuery(termsToDeleteByQuery);
-    termsToDeleteByQuery.clear();
+  // The operations in the segment to send on this attempt: not completed on an earlier attempt, and not failed
+  // permanently. A permanent failure is added to segmentFailures again.
+  private static Map<Pair<String, String>, Document> pending(BatchAttempt attempt,
+      Map<Pair<String, String>, Document> operations, Map<Document, Exception> segmentFailures) {
+    Map<Pair<String, String>, Document> pending = new LinkedHashMap<>();
+    for (Map.Entry<Pair<String, String>, Document> entry : operations.entrySet()) {
+      Document doc = entry.getValue();
+      if (attempt.permanentFailures.containsKey(doc)) {
+        segmentFailures.put(doc, attempt.permanentFailures.get(doc));
+      } else if (!attempt.completed.contains(doc)) {
+        pending.put(entry.getKey(), doc);
+      }
+    }
+    return pending;
+  }
+
+  // A request that throws fails each document it was sending. Until something in the batch has completed, the exception
+  // is rethrown instead, failing the whole batch as it would without retries.
+  private static void failAll(BatchAttempt attempt, Collection<Document> docs, IndexerException e,
+      Map<Document, Exception> segmentFailures) throws IndexerException {
+    if (attempt.completed.isEmpty()) {
+      throw e;
+    }
+    for (Document doc : docs) {
+      segmentFailures.putIfAbsent(doc, e);
+    }
+  }
+
+  // The documents that were sent and didn't fail completed; a non-retryable failure is remembered as permanent.
+  private void recordOutcome(BatchAttempt attempt, Collection<Document> sent, Map<Document, Exception> segmentFailures) {
+    for (Document doc : sent) {
+      Exception failure = segmentFailures.get(doc);
+      if (failure == null) {
+        attempt.completed.add(doc);
+      } else if (!isRetryable(failure)) {
+        attempt.permanentFailures.put(doc, failure);
+      }
+    }
+  }
+
+  private static IndexerRetryableException notSent(IndexerRetryableException cause) {
+    return new IndexerRetryableException(cause.getStatusCode(),
+        "Not sent on this attempt: an earlier part of its batch failed and is being retried", cause);
+  }
+
+  // Returns the state of the attempts at this batch, or null when retries are disabled. Each sending thread runs all of
+  // its batch's attempts in turn (the base Indexer's sendWithRetry), so concurrent batches each have their own.
+  private BatchAttempt startAttempt(List<Document> documents) {
+    if (getMaxRetries() == 0) {
+      return null;
+    }
+    BatchAttempt attempt = batchAttempt.get();
+    if (attempt == null || attempt.batch != documents) {
+      attempt = new BatchAttempt(documents);
+      batchAttempt.set(attempt);
+    }
+    attempt.attempts++;
+    return attempt;
+  }
+
+  // Forgets the batch once the base Indexer won't retry it, by the same rule it uses, so its documents aren't kept.
+  private void finishAttempt(BatchAttempt attempt, Throwable thrown, Map<Document, Exception> failures) {
+    boolean willRetry = attempt.attempts <= getMaxRetries()
+        && (thrown != null ? isRetryable(thrown) : failures.values().stream().anyMatch(this::isRetryable));
+    if (!willRetry) {
+      batchAttempt.remove();
+    }
+  }
+
+  private static void addFailures(Map<Document, Exception> failures, List<IndexerFailure> toAdd) {
+    for (IndexerFailure failure : toAdd) {
+      failures.putIfAbsent(failure.document(), failure.cause());
+    }
+  }
+
+  // The failures in batch order, each document once.
+  private static List<IndexerFailure> toFailureList(List<Document> documents, Map<Document, Exception> failures) {
+    List<IndexerFailure> result = new ArrayList<>();
+    if (failures.isEmpty()) {
+      return result;
+    }
+    Set<Document> seen = Collections.newSetFromMap(new IdentityHashMap<>());
+    for (Document doc : documents) {
+      Exception cause = failures.get(doc);
+      if (cause != null && seen.add(doc)) {
+        result.add(new IndexerFailure(doc, cause));
+      }
+    }
+    return result;
+  }
+
+  private sealed interface Segment permits WriteSegment, QuerySegment {
+    Collection<Document> documents();
+  }
+
+  // Uploads and deletes by id sent together. They never share an (index, id), so their order between each other
+  // doesn't matter.
+  private static final class WriteSegment implements Segment {
+    private final Map<Pair<String, String>, Document> uploads = new LinkedHashMap<>();
+    // the document that marked each (index, id) for deletion, so deleteById can send its version
+    private final Map<Pair<String, String>, Document> deletes = new LinkedHashMap<>();
+
+    @Override
+    public Collection<Document> documents() {
+      List<Document> docs = new ArrayList<>(uploads.values());
+      docs.addAll(deletes.values());
+      return docs;
+    }
+  }
+
+  // A run of consecutive delete-by-query documents, combined into one query per index.
+  private record QuerySegment(List<Document> documents) implements Segment {
+  }
+
+  // The terms to delete for the delete-by-query documents: for each (index, field name), the values to match.
+  private Map<Pair<String, String>, List<String>> deleteByQueryTerms(List<Document> queryDocs) {
+    Map<Pair<String, String>, List<String>> terms = new LinkedHashMap<>();
+    for (Document doc : queryDocs) {
+      String indexToSend = Optional.ofNullable(getIndexOverride(doc)).orElse(index);
+      terms.computeIfAbsent(Pair.of(indexToSend, getDeleteByQueryFieldName(doc)), k -> new ArrayList<>())
+          .add(getDeleteByQueryValue(doc));
+    }
+    return terms;
+  }
+
+  private static final class BatchAttempt {
+    private final List<Document> batch;
+    // the number of times the batch has been sent, this attempt included
+    private int attempts;
+    // identity sets, so documents are never hashed
+    private final Set<Document> completed = Collections.newSetFromMap(new IdentityHashMap<>());
+    private final Map<Document, Exception> permanentFailures = new IdentityHashMap<>();
+
+    private BatchAttempt(List<Document> batch) {
+      this.batch = batch;
+    }
   }
 
   private void deleteById(Map<Pair<String, String>, Document> idsToDelete) throws IndexerException {
@@ -279,7 +550,7 @@ public class OpenSearchIndexer extends Indexer {
         }
         // a 409 on a versioned delete means the index already holds this version or a newer one: either this delete
         // was applied on an earlier attempt of the batch (a retry resends it), or a newer document superseded it
-        if (item.status() == 409 && i < versioned.size() && versioned.get(i)) {
+        if (item.status() == HTTP_CONFLICT && i < versioned.size() && versioned.get(i)) {
           log.debug("Versioned delete of id: {} already applied or superseded: {}", item.id(), item.error().reason());
           continue;
         }
@@ -388,13 +659,63 @@ public class OpenSearchIndexer extends Indexer {
     }
   }
 
+  /**
+   * Uploads the documents in one bulk request. With opensearch.splitOnRequestTooLarge, a request OpenSearch rejects as
+   * too large (HTTP 413, a body over http.max_content_length) is split in half and each half is uploaded on its own, so
+   * one oversized document doesn't fail the rest of its batch. A single document that still gets a 413 fails
+   * permanently. Once a request is split, each half's exception is returned as a failure of each of its documents, since
+   * the other half may already be indexed.
+   */
   private List<IndexerFailure> uploadDocuments(Map<Pair<String, String>, Document> documentsToUpload) throws IndexerException {
-
     if (documentsToUpload.isEmpty()) {
       return List.of();
     }
 
+    try {
+      return sendUploadRequest(documentsToUpload);
+    } catch (IndexerRetryableException e) {
+      if (!splitOnRequestTooLarge || e.getStatusCode() != HTTP_REQUEST_TOO_LARGE) {
+        throw e;
+      }
+      if (documentsToUpload.size() == 1) {
+        Map.Entry<Pair<String, String>, Document> only = documentsToUpload.entrySet().iterator().next();
+        log.error("OpenSearch rejected document {} for index {} on its own with HTTP 413: it exceeds http.max_content_length.",
+            only.getKey().getRight(), only.getKey().getLeft());
+        return List.of(new IndexerFailure(only.getValue(), new IndexerException(
+            "Document exceeds OpenSearch http.max_content_length (HTTP 413) when sent on its own", e)));
+      }
+
+      List<Map.Entry<Pair<String, String>, Document>> entries = new ArrayList<>(documentsToUpload.entrySet());
+      int mid = entries.size() / 2;
+      log.warn("OpenSearch rejected a bulk request of {} documents with HTTP 413; splitting it into {} and {}.",
+          entries.size(), mid, entries.size() - mid);
+      List<IndexerFailure> failedDocs = new ArrayList<>(uploadSplitPart(entries.subList(0, mid)));
+      failedDocs.addAll(uploadSplitPart(entries.subList(mid, entries.size())));
+      return failedDocs;
+    }
+  }
+
+  private List<IndexerFailure> uploadSplitPart(List<Map.Entry<Pair<String, String>, Document>> entries) {
+    Map<Pair<String, String>, Document> part = new LinkedHashMap<>();
+    for (Map.Entry<Pair<String, String>, Document> entry : entries) {
+      part.put(entry.getKey(), entry.getValue());
+    }
+    try {
+      return uploadDocuments(part);
+    } catch (IndexerException e) {
+      List<IndexerFailure> failedDocs = new ArrayList<>();
+      for (Document doc : part.values()) {
+        failedDocs.add(new IndexerFailure(doc, e));
+      }
+      return failedDocs;
+    }
+  }
+
+  private List<IndexerFailure> sendUploadRequest(Map<Pair<String, String>, Document> documentsToUpload) throws IndexerException {
     List<Map.Entry<Pair<String, String>, Document>> uploads = new ArrayList<>(documentsToUpload.entrySet());
+    // whether each upload, in request order, was sent with an external version; the response items come back in the
+    // same order
+    List<Boolean> versioned = new ArrayList<>();
     BulkRequest.Builder br = new BulkRequest.Builder();
 
     for (Map.Entry<Pair<String, String>, Document> entry : documentsToUpload.entrySet()) {
@@ -422,6 +743,7 @@ public class OpenSearchIndexer extends Indexer {
       Long versionNum = (versionType == VersionType.External || versionType == VersionType.ExternalGte)
           ? getVersionNum(doc)
           : null;
+      versioned.add(versionNum != null);
 
       if (update) {
         br.operations(op -> op
@@ -461,8 +783,9 @@ public class OpenSearchIndexer extends Indexer {
       // HTTP-level error with a known status code — wrap so the base Indexer can apply retry policy
       throw new IndexerRetryableException(e.status(), "OpenSearch returned HTTP " + e.status(), e);
     } catch (IOException e) {
-      // Transport-level failure (connection refused, timeout, etc.) — no status code available
-      throw new IndexerRetryableException("Transport failure communicating with OpenSearch", e);
+      // Transport-level failure (connection refused, timeout, etc.) — no status code available, except for a 413 when
+      // opensearch.splitOnRequestTooLarge is set
+      throw transportFailure(e);
     }
 
     if (response != null) {
@@ -472,6 +795,12 @@ public class OpenSearchIndexer extends Indexer {
       for (int i = 0; i < items.size(); i++) {
         BulkResponseItem item = items.get(i);
         if (item.error() != null) {
+          // a 409 on an upload sent with an external version means the index already holds that version or a newer
+          // one: a newer write superseded this one, or this upload was applied on an earlier attempt of the batch
+          if (item.status() == HTTP_CONFLICT && i < versioned.size() && versioned.get(i)) {
+            log.debug("Versioned upload of id: {} already applied or superseded: {}", item.id(), item.error().reason());
+            continue;
+          }
           // For the error - if the item lines up with a document we sent, then it failed, and we add it to the list.
           // If not, we don't know what the error is, and opt to throw an actual IndexerException instead.
           if (i < uploads.size() && uploads.get(i).getKey().getRight().equals(item.id())) {
@@ -490,6 +819,21 @@ public class OpenSearchIndexer extends Indexer {
     }
 
     return failedDocs;
+  }
+
+  // With opensearch.splitOnRequestTooLarge, recovers the status of a 413 from the cause chain. OpenSearch's 413 for a
+  // body over http.max_content_length has no error body the client can parse, so it arrives as an IOException carrying
+  // an httpclient5 ResponseException, not as an OpenSearchException. Other statuses stay unknown, as before.
+  private IndexerRetryableException transportFailure(IOException e) {
+    if (splitOnRequestTooLarge) {
+      for (Throwable t = e; t != null; t = (t.getCause() == t ? null : t.getCause())) {
+        if (t instanceof ResponseException responseException && responseException.status() == HTTP_REQUEST_TOO_LARGE) {
+          return new IndexerRetryableException(HTTP_REQUEST_TOO_LARGE,
+              "OpenSearch returned HTTP 413: request body exceeds http.max_content_length", e);
+        }
+      }
+    }
+    return new IndexerRetryableException("Transport failure communicating with OpenSearch", e);
   }
 
   /** Only call on documents that have children. */
